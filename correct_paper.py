@@ -431,16 +431,35 @@ def _register_reference(
 
 
 def _normalize_shading(image: np.ndarray) -> np.ndarray:
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    background = cv2.GaussianBlur(gray, (0, 0), SHADE_SIGMA)
-    return cv2.divide(gray, background, scale=255)
+    if image.ndim == 2:
+        background = cv2.GaussianBlur(image, (0, 0), SHADE_SIGMA)
+        return cv2.divide(image, background, scale=255)
+
+    float_image = image.astype(np.float32)
+    background = cv2.GaussianBlur(float_image, (0, 0), SHADE_SIGMA)
+    normalized_bgr = np.clip(
+        cv2.divide(float_image, background, scale=255.0),
+        0,
+        255,
+    ).astype(np.uint8)
+
+    normalized_lab = cv2.cvtColor(normalized_bgr, cv2.COLOR_BGR2LAB)
+    original_lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    lightness = normalized_lab[:, :, 0]
+    a_channel = original_lab[:, :, 1]
+    b_channel = original_lab[:, :, 2]
+    normalized_lab = cv2.merge((lightness, a_channel, b_channel))
+    return cv2.cvtColor(normalized_lab, cv2.COLOR_LAB2BGR)
 
 
 def _add_top_safety_margin(image: np.ndarray) -> np.ndarray:
-    if image.ndim != 2 or image.shape[0] <= TOP_SAFETY_SHIFT_ROWS:
+    if image.shape[0] <= TOP_SAFETY_SHIFT_ROWS:
         return image
 
-    top_band = image[:TOP_CONTENT_CHECK_ROWS, :]
+    if image.ndim == 2:
+        top_band = image[:TOP_CONTENT_CHECK_ROWS, :]
+    else:
+        top_band = cv2.cvtColor(image[:TOP_CONTENT_CHECK_ROWS, :], cv2.COLOR_BGR2GRAY)
     top_mean = float(top_band.mean())
     top_std = float(top_band.std())
     if top_mean >= TOP_CONTENT_MEAN_THRESHOLD or top_std <= TOP_CONTENT_STD_THRESHOLD:
@@ -450,9 +469,6 @@ def _add_top_safety_margin(image: np.ndarray) -> np.ndarray:
     if top_mean < TOP_EXTRA_MEAN_THRESHOLD and top_std > TOP_EXTRA_STD_THRESHOLD:
         shift_rows = TOP_EXTRA_SHIFT_ROWS
 
-    fill = np.full(
-        (shift_rows, image.shape[1]),
-        255,
-        dtype=image.dtype,
-    )
+    fill_shape = (shift_rows, image.shape[1]) if image.ndim == 2 else (shift_rows, image.shape[1], image.shape[2])
+    fill = np.full(fill_shape, 255, dtype=image.dtype)
     return np.vstack([fill, image[:-shift_rows, :]])
