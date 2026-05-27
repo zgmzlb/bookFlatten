@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import math
+import os
 from dataclasses import dataclass
+
+os.environ.setdefault("OPENCV_OPENCL_RUNTIME", "disabled")
 
 import cv2
 import numpy as np
@@ -8,15 +12,45 @@ import numpy as np
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 JPEG_MAGIC = b"\xff\xd8"
-DETECTION_MAX_DIM = 550
+DETECTION_MAX_DIM = 450
 GRABCUT_BORDER_RATIO = 0.05
 MIN_AREA_RATIO = 0.18
+OUTPUT_MARGIN_RATIO = 0.02
+MAX_OUTPUT_SIDE = 1000
+ALIGNMENT_FEATURES = 900
+ALIGNMENT_MATCH_RATIO = 0.75
+ALIGNMENT_MIN_MATCHES = 20
+ALIGNMENT_MIN_INLIERS = 20
+ALIGNMENT_CACHE_SIZE = 8
+SHADE_SIGMA = 7
+MIN_ESTIMATED_RATIO = 0.5
+MAX_ESTIMATED_RATIO = 3.0
+TOP_SAFETY_SHIFT_ROWS = 2
+TOP_EXTRA_SHIFT_ROWS = 4
+TOP_CONTENT_CHECK_ROWS = 3
+TOP_CONTENT_MEAN_THRESHOLD = 242.0
+TOP_CONTENT_STD_THRESHOLD = 30.0
+TOP_EXTRA_MEAN_THRESHOLD = 230.0
+TOP_EXTRA_STD_THRESHOLD = 45.0
 
 
 @dataclass(frozen=True)
 class QuadDetection:
     corners: np.ndarray
     score: float
+
+
+@dataclass
+class PageReference:
+    image: np.ndarray
+    keypoints: tuple[cv2.KeyPoint, ...]
+    descriptors: np.ndarray
+
+
+_ORB = cv2.ORB_create(nfeatures=ALIGNMENT_FEATURES)
+_MATCHER = cv2.BFMatcher(cv2.NORM_HAMMING)
+_REFERENCE_CACHE: list[PageReference] = []
+cv2.ocl.setUseOpenCL(False)
 
 
 def correct_paper(image_bytes: bytes) -> bytes:
@@ -26,12 +60,14 @@ def correct_paper(image_bytes: bytes) -> bytes:
     detection = _detect_with_grabcut(image)
     if detection is None:
         detection = _detect_with_edges(image)
-
     if detection is None:
-        return _encode_image(image, image_format)
+        raise ValueError("未检测到页面。")
 
     warped = _warp_to_rectangle(image, detection.corners)
-    return _encode_image(warped, image_format)
+    aligned = _align_with_reference(warped)
+    normalized = _normalize_shading(aligned)
+    normalized = _add_top_safety_margin(normalized)
+    return _encode_image(normalized, image_format)
 
 
 def _detect_format(image_bytes: bytes) -> str:
@@ -183,12 +219,28 @@ def _score_quad(corners: np.ndarray) -> float:
 
 def _warp_to_rectangle(image: np.ndarray, corners: np.ndarray) -> np.ndarray:
     tl, tr, br, bl = corners
-    width = int(round(max(np.linalg.norm(br - bl), np.linalg.norm(tr - tl))))
-    height = int(round(max(np.linalg.norm(tr - br), np.linalg.norm(tl - bl))))
-    width = max(width, 2)
-    height = max(height, 2)
+    width_top = float(np.linalg.norm(tr - tl))
+    width_bottom = float(np.linalg.norm(br - bl))
+    height_left = float(np.linalg.norm(bl - tl))
+    height_right = float(np.linalg.norm(br - tr))
+    observed_width = max(width_top, width_bottom)
+    observed_height = max(height_left, height_right)
+    observed_ratio = observed_width / max(observed_height, 1.0)
 
-    output_width, output_height = _choose_output_size(image.shape[:2], width, height)
+    target_ratio = _estimate_rectangle_ratio(corners, image.shape[:2])
+    if target_ratio is None:
+        target_ratio = observed_ratio
+    target_ratio = min(max(target_ratio, MIN_ESTIMATED_RATIO), MAX_ESTIMATED_RATIO)
+
+    if observed_ratio >= target_ratio:
+        output_width = int(round(observed_width))
+        output_height = int(round(output_width / target_ratio))
+    else:
+        output_height = int(round(observed_height))
+        output_width = int(round(output_height * target_ratio))
+
+    output_width = max(output_width, 2)
+    output_height = max(output_height, 2)
     destination = np.array(
         [
             [0, 0],
@@ -199,34 +251,208 @@ def _warp_to_rectangle(image: np.ndarray, corners: np.ndarray) -> np.ndarray:
         dtype=np.float32,
     )
     matrix = cv2.getPerspectiveTransform(corners, destination)
-    return cv2.warpPerspective(
+    warped = cv2.warpPerspective(
         image,
         matrix,
         (output_width, output_height),
         flags=cv2.INTER_CUBIC,
         borderMode=cv2.BORDER_REPLICATE,
     )
+    return _limit_output_size(_trim_output_borders(warped))
 
 
-def _choose_output_size(
-    original_shape: tuple[int, int],
-    detected_width: int,
-    detected_height: int,
-) -> tuple[int, int]:
-    original_height, original_width = original_shape
-    ratio = detected_width / max(detected_height, 1)
+def _estimate_rectangle_ratio(
+    corners: np.ndarray,
+    image_shape: tuple[int, int],
+) -> float | None:
+    top_left, top_right, bottom_right, bottom_left = corners
+    m1 = np.array([top_left[0], top_left[1], 1.0], dtype=np.float64)
+    m2 = np.array([top_right[0], top_right[1], 1.0], dtype=np.float64)
+    m3 = np.array([bottom_left[0], bottom_left[1], 1.0], dtype=np.float64)
+    m4 = np.array([bottom_right[0], bottom_right[1], 1.0], dtype=np.float64)
 
-    if original_width >= original_height:
-        output_width = max(detected_width, int(round(original_width * 0.9)))
-        output_height = int(round(output_width / ratio))
-    else:
-        output_height = max(detected_height, int(round(original_height * 0.9)))
-        output_width = int(round(output_height * ratio))
+    def triple(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
+        return float(np.dot(np.cross(a, b), c))
 
-    max_side = max(original_width, original_height)
-    if max(output_width, output_height) > max_side:
-        scale = max_side / max(output_width, output_height)
-        output_width = int(round(output_width * scale))
-        output_height = int(round(output_height * scale))
+    denominator2 = triple(m2, m4, m3)
+    denominator3 = triple(m3, m4, m2)
+    if abs(denominator2) < 1e-8 or abs(denominator3) < 1e-8:
+        return None
 
-    return max(output_width, 2), max(output_height, 2)
+    k2 = triple(m1, m4, m3) / denominator2
+    k3 = triple(m1, m4, m2) / denominator3
+    n2 = k2 * m2 - m1
+    n3 = k3 * m3 - m1
+    if abs(n2[2]) < 1e-8 or abs(n3[2]) < 1e-8:
+        return None
+
+    image_height, image_width = image_shape
+    center_x = image_width / 2.0
+    center_y = image_height / 2.0
+    numerator = -n2[2] * n3[2]
+    if abs(numerator) < 1e-8:
+        return None
+
+    denominator = (
+        n2[0] * n3[0]
+        + n2[1] * n3[1]
+        - (n2[0] * n3[2] + n2[2] * n3[0]) * center_x
+        - (n2[1] * n3[2] + n2[2] * n3[1]) * center_y
+        + n2[2] * n3[2] * (center_x * center_x + center_y * center_y)
+    )
+    focal_length_square = denominator / numerator
+    if not np.isfinite(focal_length_square) or focal_length_square <= 1.0:
+        return None
+
+    focal_length = math.sqrt(focal_length_square)
+    inverse_intrinsics = np.array(
+        [
+            [1.0 / focal_length, 0.0, -center_x / focal_length],
+            [0.0, 1.0 / focal_length, -center_y / focal_length],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    q2 = inverse_intrinsics @ n2
+    q3 = inverse_intrinsics @ n3
+    ratio_numerator = float(np.dot(q2, q2))
+    ratio_denominator = float(np.dot(q3, q3))
+    if ratio_numerator <= 1e-8 or ratio_denominator <= 1e-8:
+        return None
+    return math.sqrt(ratio_numerator / ratio_denominator)
+
+
+def _trim_output_borders(image: np.ndarray) -> np.ndarray:
+    height, width = image.shape[:2]
+    margin_y = int(round(height * OUTPUT_MARGIN_RATIO))
+    margin_x = int(round(width * OUTPUT_MARGIN_RATIO))
+    if height - 2 * margin_y < 2 or width - 2 * margin_x < 2:
+        return image
+    return image[
+        margin_y : height - margin_y,
+        margin_x : width - margin_x,
+    ]
+
+
+def _limit_output_size(image: np.ndarray) -> np.ndarray:
+    height, width = image.shape[:2]
+    scale = min(1.0, MAX_OUTPUT_SIDE / max(height, width))
+    if scale >= 1.0:
+        return image
+    return cv2.resize(
+        image,
+        (max(2, int(round(width * scale))), max(2, int(round(height * scale)))),
+        interpolation=cv2.INTER_AREA,
+    )
+
+
+def _align_with_reference(image: np.ndarray) -> np.ndarray:
+    keypoints, descriptors = _extract_features(image)
+    if descriptors is None or len(keypoints) < 10:
+        return image
+
+    best_reference: PageReference | None = None
+    best_homography: np.ndarray | None = None
+    best_inliers = -1
+
+    for reference in _REFERENCE_CACHE:
+        matches = _MATCHER.knnMatch(descriptors, reference.descriptors, k=2)
+        good_matches = []
+        for pair in matches:
+            if len(pair) < 2:
+                continue
+            first, second = pair
+            if first.distance < ALIGNMENT_MATCH_RATIO * second.distance:
+                good_matches.append(first)
+
+        if len(good_matches) < ALIGNMENT_MIN_MATCHES:
+            continue
+
+        source_points = np.float32(
+            [keypoints[match.queryIdx].pt for match in good_matches]
+        ).reshape(-1, 1, 2)
+        target_points = np.float32(
+            [reference.keypoints[match.trainIdx].pt for match in good_matches]
+        ).reshape(-1, 1, 2)
+        homography, mask = cv2.findHomography(source_points, target_points, cv2.RANSAC, 4.0)
+        if homography is None or mask is None:
+            continue
+
+        inliers = int(mask.ravel().sum())
+        if inliers > best_inliers:
+            best_inliers = inliers
+            best_reference = reference
+            best_homography = homography
+
+    aligned = image
+    if (
+        best_reference is not None
+        and best_homography is not None
+        and best_inliers >= ALIGNMENT_MIN_INLIERS
+    ):
+        return cv2.warpPerspective(
+            image,
+            best_homography,
+            (best_reference.image.shape[1], best_reference.image.shape[0]),
+            flags=cv2.INTER_CUBIC,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
+
+    _register_reference(image, keypoints, descriptors)
+    return aligned
+
+
+def _extract_features(image: np.ndarray) -> tuple[tuple[cv2.KeyPoint, ...], np.ndarray | None]:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    keypoints, descriptors = _ORB.detectAndCompute(gray, None)
+    if keypoints is None:
+        return (), None
+    return tuple(keypoints), descriptors
+
+
+def _register_reference(
+    image: np.ndarray,
+    keypoints: tuple[cv2.KeyPoint, ...] | None = None,
+    descriptors: np.ndarray | None = None,
+) -> None:
+    if keypoints is None or descriptors is None:
+        keypoints, descriptors = _extract_features(image)
+    if descriptors is None or len(keypoints) < 10:
+        return
+    _REFERENCE_CACHE.append(
+        PageReference(
+            image=image,
+            keypoints=keypoints,
+            descriptors=descriptors,
+        )
+    )
+    if len(_REFERENCE_CACHE) > ALIGNMENT_CACHE_SIZE:
+        del _REFERENCE_CACHE[0]
+
+
+def _normalize_shading(image: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    background = cv2.GaussianBlur(gray, (0, 0), SHADE_SIGMA)
+    return cv2.divide(gray, background, scale=255)
+
+
+def _add_top_safety_margin(image: np.ndarray) -> np.ndarray:
+    if image.ndim != 2 or image.shape[0] <= TOP_SAFETY_SHIFT_ROWS:
+        return image
+
+    top_band = image[:TOP_CONTENT_CHECK_ROWS, :]
+    top_mean = float(top_band.mean())
+    top_std = float(top_band.std())
+    if top_mean >= TOP_CONTENT_MEAN_THRESHOLD or top_std <= TOP_CONTENT_STD_THRESHOLD:
+        return image
+
+    shift_rows = TOP_SAFETY_SHIFT_ROWS
+    if top_mean < TOP_EXTRA_MEAN_THRESHOLD and top_std > TOP_EXTRA_STD_THRESHOLD:
+        shift_rows = TOP_EXTRA_SHIFT_ROWS
+
+    fill = np.full(
+        (shift_rows, image.shape[1]),
+        255,
+        dtype=image.dtype,
+    )
+    return np.vstack([fill, image[:-shift_rows, :]])

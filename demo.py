@@ -1,8 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import multiprocessing as mp
+import os
+import traceback
 from pathlib import Path
 from time import perf_counter
+
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 from correct_paper import correct_paper
 
@@ -29,6 +36,32 @@ def process_one(input_path: Path, output_path: Path) -> float:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_bytes(corrected)
     return elapsed
+
+
+def _process_one_worker(input_path: str, output_path: str, queue: mp.Queue) -> None:
+    try:
+        elapsed = process_one(Path(input_path), Path(output_path))
+        queue.put(("ok", elapsed))
+    except Exception:
+        queue.put(("err", traceback.format_exc()))
+
+
+def process_one_isolated(input_path: Path, output_path: Path) -> float:
+    ctx = mp.get_context("spawn")
+    queue: mp.Queue = ctx.Queue()
+    process = ctx.Process(
+        target=_process_one_worker,
+        args=(str(input_path), str(output_path), queue),
+    )
+    process.start()
+    result = queue.get()
+    process.join()
+
+    if process.exitcode != 0 and result[0] != "err":
+        raise RuntimeError(f"worker exited with code {process.exitcode}")
+    if result[0] == "err":
+        raise RuntimeError(result[1])
+    return float(result[1])
 
 
 def main() -> None:
@@ -63,7 +96,7 @@ def main() -> None:
     total = 0.0
     for path in images:
         output_path = args.output_dir / path.name
-        elapsed = process_one(path, output_path)
+        elapsed = process_one_isolated(path, output_path)
         total += elapsed
         print(f"{path.name}: {elapsed:.4f}s -> {output_path}")
 
@@ -72,4 +105,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    mp.freeze_support()
     main()
